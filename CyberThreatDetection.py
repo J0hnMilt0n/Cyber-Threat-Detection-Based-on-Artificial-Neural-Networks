@@ -115,17 +115,34 @@ def neuralNetwork():
     global lstm_acc,lstm_precision,lstm_fm,lstm_recall
     global cnn_acc,cnn_precision,cnn_fm,cnn_recall
     Y1 = Y.reshape((len(Y),1))
-    X_train1, X_test1, y_trains1, y_tests1 = train_test_split(X, Y1, test_size=0.2)
+    # Use stratified split so train set contains examples of each class when possible
+    try:
+        X_train1, X_test1, y_trains1, y_tests1 = train_test_split(X, Y1, test_size=0.2, stratify=Y)
+    except Exception:
+        # fallback to non-stratified split if stratify isn't possible (very small datasets)
+        X_train1, X_test1, y_trains1, y_tests1 = train_test_split(X, Y1, test_size=0.2)
+    # Also populate module-level train/test variables for other classifier callbacks
+    global X_train, X_test, y_train, y_test
+    # copy 1D label arrays for compatibility with sklearn classifiers
+    X_train, X_test = X_train1.copy(), X_test1.copy()
+    y_train = y_trains1.reshape(-1)
+    y_test = y_tests1.reshape(-1)
     print(X_train1.shape)
     print(y_trains1.shape)
     print(X_test1.shape)
     print(y_tests1.shape)
-    enc = OneHotEncoder()
-    enc.fit(y_trains1)
-    y_train1  = enc.transform(y_trains1)
-    enc = OneHotEncoder()
-    enc.fit(y_tests1)
-    y_test1   = enc.transform(y_tests1)
+    # Ensure OneHotEncoder returns dense arrays (sklearn v1.2+ uses sparse_output)
+    # Fit-on-train and transform test labels using handle_unknown='ignore' so unseen
+    # classes in very small splits don't raise errors. Support older sklearn APIs.
+    try:
+        enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        y_train1 = enc.fit_transform(y_trains1).astype('float32')
+        y_test1 = enc.transform(y_tests1).astype('float32')
+    except TypeError:
+        # older sklearn versions may not support sparse_output param
+        enc = OneHotEncoder(handle_unknown='ignore')
+        y_train1 = enc.fit_transform(y_trains1).toarray().astype('float32')
+        y_test1 = enc.transform(y_tests1).toarray().astype('float32')
     #rehsaping traing
     print("X_train.shape before  = ",X_train1.shape)
     X_train2 = X_train1.reshape((X_train1.shape[0], X_train1.shape[1], 1))   
@@ -142,20 +159,26 @@ def neuralNetwork():
     model.add(Dropout(0.5))
     model.add(Dense(32, activation='relu'))
     model.add(Dense(y_train1.shape[1], activation='softmax'))
-    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    # use categorical_crossentropy for multiclass one-hot targets
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
     print(model.summary())
     hist = model.fit(X_train2, y_train1, epochs=1, batch_size=256)
     prediction_data = model.predict(X_test2)
     prediction_data = np.argmax(prediction_data, axis=1)
-    y_test1 = np.argmax(y_test1, axis=1)
-    lstm_acc = accuracy_score(y_test1,prediction_data)*100
+    # y_test1 may already be 1D if using integer labels or after argmax; handle safely
+    if y_test1.ndim > 1:
+        y_test_labels = np.argmax(y_test1, axis=1)
+    else:
+        y_test_labels = y_test1.astype('int')
+    # use y_test_labels (1D integer labels) for metric calculations
+    lstm_acc = accuracy_score(y_test_labels,prediction_data)*100
     acc = hist.history['accuracy']
     for k in range(len(acc)):
         print("===="+str(k)+" "+str(acc[k]))
     lstm_acc = acc[0] * 100
-    lstm_precision = precision_score(y_test1,prediction_data,average='macro') * 100
-    lstm_recall = recall_score(y_test1,prediction_data,average='macro') * 100
-    lstm_fm = f1_score(y_test1,prediction_data,average='macro') * 100
+    lstm_precision = precision_score(y_test_labels,prediction_data,average='macro') * 100
+    lstm_recall = recall_score(y_test_labels,prediction_data,average='macro') * 100
+    lstm_fm = f1_score(y_test_labels,prediction_data,average='macro') * 100
     
     if lstm_precision < 1:
         lstm_precision = lstm_precision * 100
@@ -191,13 +214,17 @@ def neuralNetwork():
 
     prediction_data = cnn_model.predict(X_test1)
     prediction_data = np.argmax(prediction_data, axis=1)
-    y_test1 = np.argmax(y_test1, axis=1)
-    cnn_acc = accuracy_score(y_test1,prediction_data)*100
+    if y_test1.ndim > 1:
+        y_test_labels_cnn = np.argmax(y_test1, axis=1)
+    else:
+        y_test_labels_cnn = y_test1.astype('int')
+    cnn_acc = accuracy_score(y_test_labels_cnn,prediction_data)*100
     acc = hist1.history['accuracy']
     cnn_acc = acc[4] * 100
-    cnn_precision = precision_score(y_test1,prediction_data,average='macro') * 100
-    cnn_recall = recall_score(y_test1,prediction_data,average='macro') * 100
-    cnn_fm = f1_score(y_test1,prediction_data,average='macro') * 100
+    # use label array for CNN metrics too
+    cnn_precision = precision_score(y_test_labels_cnn,prediction_data,average='macro') * 100
+    cnn_recall = recall_score(y_test_labels_cnn,prediction_data,average='macro') * 100
+    cnn_fm = f1_score(y_test_labels_cnn,prediction_data,average='macro') * 100
     if cnn_precision < 1:
         cnn_precision = cnn_precision * 100
     else:
@@ -223,8 +250,7 @@ def svmClassifier():
     cls = svm.SVC()
     cls.fit(X_train, y_train)
     prediction_data = cls.predict(X_test)
-    for i in range(1,300):
-        prediction_data[i] = 30
+    # don't overwrite predictions with out-of-range indexes; removed unsafe loop
     svm_acc = accuracy_score(y_test,prediction_data)*100
     svm_precision = precision_score(y_test, prediction_data,average='macro') * 100
     svm_recall = recall_score(y_test, prediction_data,average='macro') * 100
@@ -242,12 +268,13 @@ def knn():
     global knn_fm
     global knn_acc
     #text.delete('1.0', END)
-    cls = KNeighborsClassifier(n_neighbors = 10) 
+    # ensure n_neighbors <= number of training samples
+    n_neighbors = min(10, max(1, len(X_train)))
+    cls = KNeighborsClassifier(n_neighbors = n_neighbors) 
     cls.fit(X_train, y_train) 
     text.insert(END,"\nKNN Prediction Results\n") 
     prediction_data = cls.predict(X_test)
-    for i in range(1,300):
-        prediction_data[i] = 30
+    # removed unsafe manipulation of prediction array
     knn_precision = precision_score(y_test, prediction_data,average='macro') * 100
     knn_recall = recall_score(y_test, prediction_data,average='macro') * 100
     knn_fm = f1_score(y_test, prediction_data,average='macro') * 100
@@ -267,8 +294,7 @@ def randomForest():
     cls.fit(X_train, y_train)
     text.insert(END,"\nRandom Forest Prediction Results\n") 
     prediction_data = cls.predict(X_test)
-    for i in range(1,400):
-        prediction_data[i] = 30
+    # removed unsafe prediction overwrite loop
     random_precision = precision_score(y_test, prediction_data,average='macro') * 100
     random_recall = recall_score(y_test, prediction_data,average='macro') * 100
     random_fm = f1_score(y_test, prediction_data,average='macro') * 100
@@ -289,8 +315,7 @@ def naiveBayes():
     cls.fit(X_train, y_train)
     text.insert(END,"\nNaive Bayes Prediction Results\n") 
     prediction_data = cls.predict(X_test)
-    for i in range(1,500):
-        prediction_data[i] = 30
+    # removed unsafe prediction overwrite loop
     nb_precision = precision_score(y_test, prediction_data,average='macro') * 100
     nb_recall = recall_score(y_test, prediction_data,average='macro') * 100
     nb_fm = f1_score(y_test, prediction_data,average='macro') * 100
